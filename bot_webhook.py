@@ -21,6 +21,7 @@ log = logging.getLogger("bot")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON")
+TELEGRAM_SECRET_TOKEN = os.getenv("TELEGRAM_SECRET_TOKEN")  # опционально
 
 if not all([TELEGRAM_TOKEN, SPREADSHEET_ID, GOOGLE_CREDS_JSON]):
     raise RuntimeError("Missing required env vars")
@@ -61,15 +62,25 @@ USERS_SHEET = "Пользователи"
 PROD_HEADERS = ["Дата", "Смена", "Продукция", "Количество", "Пользователь", "Время отправки", "Статус"]
 USERS_HEADERS = ["TelegramID", "ФИО", "Роль", "Статус", "Запросил у", "Дата создания", "Подтвердил", "Дата подтверждения"]
 
-# ========== Telegram send wrapper ==========
+
+# ========== Telegram API wrapper ==========
+def tg_api_call(method: str, payload: dict):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}"
+    try:
+        resp = requests.post(url, json=payload, timeout=10)
+        if not resp.ok:
+            log.warning("Telegram API %s failed: %s %s", method, resp.status_code, resp.text)
+        return resp
+    except Exception:
+        log.exception("Telegram API %s error", method)
+        return None
+
+
 def tg_send(chat_id: int, text: str, markup: Optional[dict] = None):
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
     if markup:
         payload["reply_markup"] = json.dumps(markup, ensure_ascii=False)
-    try:
-        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json=payload, timeout=10)
-    except Exception as e:
-        log.exception("tg_send error: %s", e)
+    tg_api_call("sendMessage", payload)
 
 
 # ========== SheetClient — encapsulate sheet ops + caching ==========
@@ -283,7 +294,6 @@ class SheetClient:
         return res
 
 
-
 # instantiate
 sheet_client = SheetClient(sh, cache_ttl=5)
 
@@ -328,18 +338,27 @@ def build_product_kb(sheet_name: str, extra: Optional[List[str]] = None) -> dict
 
 
 # Controllers list (cached)
-_CONTROLLERS_CACHE: Dict[str, Any] = {"rf": {"until": 0, "data": []}, "ppi": {"until": 0, "data": []}}
+_CONTROLLERS_CACHE: Dict[str, Any] = {
+    "rf": {"until": 0, "data": []},
+    "ppi": {"until": 0, "data": []},
+}
+
+
 def get_controllers_cached(sheet_name: str, ttl: int = 600) -> List[int]:
     key = "rf" if sheet_name == CTRL_RF_SHEET else "ppi"
     now_ts = time.time()
-    if _CONTROLLERS_CACHE[key]["until"] > now_ts and _CONTROLLERS_CACHE[key]["data"]:
-        return _CONTROLLERS_CACHE[key]["data"]
+    cache = _CONTROLLERS_CACHE[key]
+
+    if cache["until"] > now_ts and cache["data"]:
+        return cache["data"]
+
     try:
         data = sheet_client.get_controllers(sheet_name)
     except Exception:
         data = []
-    _CONTROLLERS_CACHE[key]["data"] = data
-    _CONTROLLERS_CACHE[key]["until"] = now_ts + ttl
+
+    cache["data"] = data
+    cache["until"] = now_ts + ttl
     return data
 
 
@@ -371,9 +390,12 @@ class AuthManager:
         text = f"<b>Новая заявка на доступ</b>\nФИО: {fio}\nID: <code>{uid}</code>"
         for a in approvers:
             try:
-                requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                              json={"chat_id": a, "text": text, "parse_mode": "HTML", "reply_markup": json.dumps(kb, ensure_ascii=False)},
-                              timeout=10)
+                tg_api_call("sendMessage", {
+                    "chat_id": a,
+                    "text": text,
+                    "parse_mode": "HTML",
+                    "reply_markup": json.dumps(kb, ensure_ascii=False),
+                })
             except Exception:
                 log.exception("notify approver failed for %s", a)
 
@@ -428,6 +450,7 @@ class AuthManager:
 
 auth = AuthManager(sheet_client)
 
+
 # ========== FSM: управление состояниями и диалогами ==========
 class FSM:
     def __init__(self, sc: SheetClient, authm: AuthManager):
@@ -465,6 +488,13 @@ class FSM:
         self.states.pop(uid, None)
         self.last_activity.pop(uid, None)
 
+    def send_main_menu(self, chat: int, user_fio: Optional[str] = None):
+        if user_fio:
+            first_name = user_fio.split()[0]
+            tg_send(chat, f"Привет, {first_name}! Выберите действие:", MAIN_KB)
+        else:
+            tg_send(chat, "Главное меню:", MAIN_KB)
+
     def handle_text(self, uid: int, chat: int, text: str, user_repr: str):
         self.touch(uid)
         self.ensure_state(uid, chat)
@@ -473,13 +503,12 @@ class FSM:
         # navigation & cancel
         if text == "Назад":
             self.clear_state(uid)
-            tg_send(chat, "Главное меню:", MAIN_KB)
+            self.send_main_menu(chat)
             return
         if text == "Отмена":
             st.pop("pending_cancel", None)
-            # keep the state cleared
             self.clear_state(uid)
-            tg_send(chat, "Отменено.", MAIN_KB)
+            self.send_main_menu(chat)
             return
 
         # auth
@@ -488,14 +517,15 @@ class FSM:
             if st.get("waiting_fio"):
                 fio = text.strip()
                 if not fio:
-                    tg_send(chat, "Введите корректное ФИО:")
+                    tg_send(chat, "Введите корректное ФИО:", CANCEL_KB)
                     return
                 self.auth.register_user(uid, fio, requested_by="")
                 tg_send(chat, "Спасибо! Ваша заявка отправлена на подтверждение.")
                 self.clear_state(uid)
                 return
+
             st["waiting_fio"] = True
-            tg_send(chat, "Вы не зарегистрированы. Введите ваше ФИО:")
+            tg_send(chat, "Вы не зарегистрированы. Введите ваше ФИО:", CANCEL_KB)
             return
 
         if user["status"] != "подтвержден":
@@ -512,7 +542,7 @@ class FSM:
                 st["flow"] = "ppi"
                 tg_send(chat, "<b>Полимерно-песчаное производство</b>\nВыберите действие:", FLOW_MENU_KB)
                 return
-            tg_send(chat, f"Привет, {user['fio'].split()[0]}! Выберите действие:", MAIN_KB)
+            self.send_main_menu(chat, user["fio"])
             return
 
         flow = st["flow"]
@@ -545,7 +575,6 @@ class FSM:
 
             tg_send(chat, msg, CONFIRM_KB)
             return
-
 
         # confirm cancel
         if "pending_cancel" in st:
@@ -604,7 +633,6 @@ class FSM:
                 st.pop("pending_cancel", None)
                 return
 
-
             if text == "Нет, оставить":
                 tg_send(chat, "Запись сохранена.", FLOW_MENU_KB)
                 st.pop("pending_cancel", None)
@@ -635,7 +663,7 @@ class FSM:
             # ensure products_list cleared
             st.pop("products_list", None)
             today = now_msk().strftime("%d.%m.%Y")
-            yest = (now_msk() - timedelta(days=1)).strftime("%d.%m.%Y")
+            yest = (now_msk() - timedelta(days=1)).strftime("%d.%м.%Y")
             tg_send(chat, "Дата:", kb_reply([[today, yest], ["Другая дата", "Отмена"]]))
             return
 
@@ -697,18 +725,13 @@ class FSM:
                 st["step"] = "product_custom"
                 tg_send(chat, "Введите название продукции:", CANCEL_KB)
                 return
-            # user may press Отмена as keyboard button
-            if text == "Отмена":
-                tg_send(chat, "Отменено.", MAIN_KB)
-                self.clear_state(uid)
-                return
             data["product"] = text.strip()
             st["step"] = "quantity"
             tg_send(chat, "Введите количество:", NUMERIC_INPUT_KB)
             return
 
         if step == "product_custom":
-            if text == "Отмена" or not text.strip():
+            if not text.strip():
                 tg_send(chat, "Введите корректное название.", CANCEL_KB)
                 return
             data["product"] = text.strip()
@@ -718,10 +741,6 @@ class FSM:
 
         # quantity
         if step == "quantity":
-            if text == "Отмена":
-                tg_send(chat, "Отменено.", MAIN_KB)
-                self.clear_state(uid)
-                return
             if not (text.replace(",", ".").replace(".", "", 1).isdigit()):
                 tg_send(chat, "Введите корректное число.", NUMERIC_INPUT_KB)
                 return
@@ -818,13 +837,7 @@ class FSM:
                 self.clear_state(uid)
                 return
 
-            # support user pressing Отмена or wrong input
-            if text == "Отмена":
-                tg_send(chat, "Отменено.", MAIN_KB)
-                self.clear_state(uid)
-                return
-
-            tg_send(chat, "Нажмите Да или Завершить.", kb_reply([["Да"], ["Завершить"], ["Отмена"]]))
+            tg_send(chat, "Нажмите Да или Завершить.", kb_reply([["Да, добавить"], ["Нет, завершить"], ["Отмена"]]))
             return
 
         # fallback
@@ -834,23 +847,42 @@ class FSM:
 # ========== Flask webhook & callbacks ==========
 app = Flask(__name__)
 LOCK_PATH = "/tmp/bot.lock"
+RATE_LIMIT_WINDOW = 1.0  # секунды между сообщениями от одного пользователя
+_last_message_at: Dict[int, float] = {}
+
+
+@app.before_request
+def verify_telegram_secret():
+    """
+    Если задан TELEGRAM_SECRET_TOKEN, проверяем заголовок
+    X-Telegram-Bot-Api-Secret-Token.
+    """
+    if request.method == "POST" and request.path == "/" and TELEGRAM_SECRET_TOKEN:
+        token = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+        if token != TELEGRAM_SECRET_TOKEN:
+            log.warning("Invalid Telegram secret token: %r", token)
+            return "forbidden", 403
+
 
 # start controllers refresher thread that warms cache once per day
 def controllers_refresher_worker(interval_min: int = 1440):
     while True:
         try:
-            sheet_client.invalidate_cache(CTRL_RF_SHEET)
-            sheet_client.invalidate_cache(CTRL_PPI_SHEET)
-            _ = sheet_client.get_controllers(CTRL_RF_SHEET)
-            _ = sheet_client.get_controllers(CTRL_PPI_SHEET)
+            now_ts = time.time()
+            for sheet_name, key in ((CTRL_RF_SHEET, "rf"), (CTRL_PPI_SHEET, "ppi")):
+                data = sheet_client.get_controllers(sheet_name)
+                _CONTROLLERS_CACHE[key]["data"] = data
+                _CONTROLLERS_CACHE[key]["until"] = now_ts + interval_min * 60
             log.info("Controllers cache refreshed")
         except Exception:
             log.exception("Error refreshing controllers cache")
         time.sleep(interval_min * 60)
 
+
 threading.Thread(target=controllers_refresher_worker, daemon=True).start()
 
 fsm = FSM(sheet_client, auth)
+
 
 @app.route("/", methods=["POST"])
 def webhook():
@@ -863,8 +895,9 @@ def webhook():
         try:
             auth.process_callback(update["callback_query"])
             # answer callback
-            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery",
-                          json={"callback_query_id": update["callback_query"]["id"]})
+            tg_api_call("answerCallbackQuery", {
+                "callback_query_id": update["callback_query"]["id"]
+            })
         except Exception:
             log.exception("callback processing error")
         return "ok", 200
@@ -879,6 +912,14 @@ def webhook():
     username = m["from"].get("username", "")
     user_repr = f"{user_id} (@{username or 'no_user'})"
 
+    # простой анти-флуд
+    now_ts = time.time()
+    last_ts = _last_message_at.get(user_id, 0.0)
+    if now_ts - last_ts < RATE_LIMIT_WINDOW:
+        log.info("Rate limited user %s", user_id)
+        return "ok", 200
+    _last_message_at[user_id] = now_ts
+
     with FileLock(LOCK_PATH):
         try:
             fsm.handle_text(user_id, chat_id, text, user_repr)
@@ -886,9 +927,11 @@ def webhook():
             log.exception("Processing error")
     return "ok", 200
 
+
 @app.route("/health")
 def health():
     return "ok", 200
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
