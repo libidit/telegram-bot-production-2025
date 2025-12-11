@@ -343,6 +343,9 @@ _CONTROLLERS_CACHE: Dict[str, Any] = {
     "ppi": {"until": 0, "data": []},
 }
 
+# pending approval notifications: target_uid -> [(chat_id, message_id), ...]
+_PENDING_REQUESTS: Dict[int, List[Tuple[int, int]]] = {}
+
 
 def get_controllers_cached(sheet_name: str, ttl: int = 600) -> List[int]:
     key = "rf" if sheet_name == CTRL_RF_SHEET else "ppi"
@@ -388,21 +391,69 @@ class AuthManager:
             ]
         }
         text = f"<b>Новая заявка на доступ</b>\nФИО: {fio}\nID: <code>{uid}</code>"
+
+        # запоминаем все отправленные сообщения с этой заявкой
+        _PENDING_REQUESTS[uid] = []
+
         for a in approvers:
             try:
-                tg_api_call("sendMessage", {
+                resp = tg_api_call("sendMessage", {
                     "chat_id": a,
                     "text": text,
                     "parse_mode": "HTML",
                     "reply_markup": json.dumps(kb, ensure_ascii=False),
                 })
+                if resp is not None:
+                    try:
+                        data = resp.json()
+                        mid = data.get("result", {}).get("message_id")
+                        if mid:
+                            _PENDING_REQUESTS[uid].append((a, mid))
+                    except Exception:
+                        log.exception("Failed to parse Telegram response for approver %s", a)
             except Exception:
                 log.exception("notify approver failed for %s", a)
+
+    def _mark_request_processed_for_all(self, target_id: int, status_text: str):
+        """
+        Обновляет все сообщения с заявкой для данного пользователя:
+        меняет текст и убирает inline-кнопки.
+        """
+        requests_list = _PENDING_REQUESTS.pop(target_id, [])
+        for chat_id, message_id in requests_list:
+            try:
+                tg_api_call("editMessageText", {
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "text": status_text,
+                    "parse_mode": "HTML",
+                })
+            except Exception:
+                log.exception("Failed to edit approval message for chat %s msg %s", chat_id, message_id)
+
+    def _close_single_request_message(self, callback: dict, info_text: str):
+        """
+        Если заявка уже обработана, закрываем клавиатуру для конкретного сообщения
+        и сообщаем пользователю.
+        """
+        chat_id = callback["message"]["chat"]["id"]
+        message_id = callback["message"]["message_id"]
+        try:
+            tg_api_call("editMessageReplyMarkup", {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "reply_markup": {"inline_keyboard": []},
+            })
+        except Exception:
+            log.exception("Failed to clear inline keyboard for processed request")
+        tg_send(chat_id, info_text)
 
     def process_callback(self, callback: dict):
         data = callback.get("data", "")
         uid = callback["from"]["id"]
         chat_id = callback["message"]["chat"]["id"]
+        message_id = callback["message"]["message_id"]
+
         if data.startswith("approve_") or data.startswith("reject_"):
             target_id = int(data.split("_", 1)[1])
             approver = self.get_user(uid)
@@ -411,21 +462,51 @@ class AuthManager:
                 return
             target = self.get_user(target_id)
             if not target:
-                tg_send(chat_id, "Целевой пользователь не найден.")
+                # если пользователя уже нет или что-то пошло не так — закрываем кнопки
+                self._close_single_request_message(callback, "Заявка уже обработана или пользователь не найден.")
                 return
+
+            # если заявка уже в статусе, отличном от "ожидает" — тоже закрываем
+            if target["status"] != "ожидает":
+                self._close_single_request_message(
+                    callback,
+                    f"Заявка для {target['fio']} уже обработана (статус: {target['status']})."
+                )
+                return
+
             if data.startswith("approve_"):
                 roles = ["operator", "master"]
                 if approver["role"] == "admin":
                     roles.append("admin")
                 kb = {"inline_keyboard": [[{"text": r, "callback_data": f"setrole_{target_id}_{r}"}] for r in roles]}
                 tg_send(chat_id, f"Выберите роль для <b>{target['fio']}</b>:", kb)
+
+                # убираем кнопки "Подтвердить/Отклонить" в этом сообщении, чтобы не кликали два раза
+                try:
+                    tg_api_call("editMessageReplyMarkup", {
+                        "chat_id": chat_id,
+                        "message_id": message_id,
+                        "reply_markup": {"inline_keyboard": []},
+                    })
+                except Exception:
+                    log.exception("Failed to clear inline keyboard on approve click")
             else:
+                # отклонение
                 self.sc.update_user(target_id, status="отклонен", confirmed_by=uid)
                 tg_send(chat_id, f"Заявка отклонена: {target['fio']}")
                 try:
                     tg_send(int(target_id), "В доступе отказано.")
                 except Exception:
                     pass
+
+                status_text = (
+                    f"<b>Заявка обработана</b>\n"
+                    f"ФИО: {target['fio']}\n"
+                    f"ID: <code>{target_id}</code>\n"
+                    f"Статус: <b>отклонена</b>"
+                )
+                self._mark_request_processed_for_all(target_id, status_text)
+
         elif data.startswith("setrole_"):
             parts = data.split("_")
             if len(parts) < 3:
@@ -439,13 +520,45 @@ class AuthManager:
             if approver["role"] == "master" and role == "admin":
                 tg_send(chat_id, "Мастер не может назначать роль admin.")
                 return
+
+            target = self.get_user(target_id)
+            if not target:
+                self._close_single_request_message(callback, "Заявка уже обработана или пользователь не найден.")
+                return
+            if target["status"] != "ожидает":
+                self._close_single_request_message(
+                    callback,
+                    f"Заявка для {target['fio']} уже обработана (статус: {target['status']})."
+                )
+                return
+
             self.sc.update_user(target_id, role=role, status="подтвержден", confirmed_by=uid)
             target = self.get_user(target_id)
             tg_send(chat_id, f"Пользователь {target['fio']} подтверждён как <b>{role}</b>")
+
+            # уберём клавиатуру выбора роли из этого сообщения
+            try:
+                tg_api_call("editMessageReplyMarkup", {
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "reply_markup": {"inline_keyboard": []},
+                })
+            except Exception:
+                log.exception("Failed to clear role selection keyboard")
+
             try:
                 tg_send(int(target_id), f"Ваша заявка подтверждена! Ваша роль: {role}\n\nВыберите действие:", MAIN_KB)
             except Exception:
                 pass
+
+            status_text = (
+                f"<b>Заявка обработана</b>\n"
+                f"ФИО: {target['fio']}\n"
+                f"ID: <code>{target_id}</code>\n"
+                f"Роль: <b>{role}</b>\n"
+                f"Статус: <b>подтверждена</b>"
+            )
+            self._mark_request_processed_for_all(target_id, status_text)
 
 
 auth = AuthManager(sheet_client)
@@ -663,7 +776,7 @@ class FSM:
             # ensure products_list cleared
             st.pop("products_list", None)
             today = now_msk().strftime("%d.%m.%Y")
-            yest = (now_msk() - timedelta(days=1)).strftime("%d.%м.%Y")
+            yest = (now_msk() - timedelta(days=1)).strftime("%d.%m.%Y")
             tg_send(chat, "Дата:", kb_reply([[today, yest], ["Другая дата", "Отмена"]]))
             return
 
